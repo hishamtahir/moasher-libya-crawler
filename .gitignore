@@ -1,0 +1,5 @@
+build/
+.gradle/
+*.json.key
+sa*.json
+.kotlin/
