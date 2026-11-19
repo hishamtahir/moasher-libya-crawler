@@ -69,11 +69,19 @@ def main():
     def sig(x):
         u = x.get('update')
         if not u or 'updateTransforms' not in x: return None, None     # latest/ticks/deletes are already change-only
-        return u['name'], hashlib.sha1(json.dumps(u['fields'], sort_keys=True).encode()).hexdigest()
+        f = dict(u['fields'])
+        try:   # snapshots embed their build time (ms) in the JSON string 's'; ignore it so only real content counts
+            o = json.loads(f['s']['stringValue'])
+            if isinstance(o, dict):
+                f['s'] = {k: v for k, v in o.items() if not (isinstance(v, int) and v > 10**12)}
+        except Exception: pass
+        return u['name'], hashlib.sha1(json.dumps(f, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     keep = []
     for x in writes:
         name, h = sig(x)
-        if name and state.get(name) == h: continue
+        prev = state.get(name) if name else None
+        # unchanged and refreshed < 19 min ago: skip (clients treat cache docs older than 30 min as stale)
+        if prev and isinstance(prev, list) and prev[0] == h and time.time() - prev[1] < 19 * 60: continue
         keep.append(x)
     if len(keep) != len(writes): print(f'unchanged skipped: {len(writes) - len(keep)}')
     writes = keep
@@ -85,7 +93,7 @@ def main():
             failed += 1; print('write failed', (x.get('update', {}).get('name') or x['delete']).split('/documents/')[1], r.status_code)
         else:
             name, h = sig(x)
-            if name: state[name] = h
+            if name: state[name] = [h, time.time()]
     if state_path:
         try: json.dump(state, open(state_path, 'w'))
         except Exception: pass
