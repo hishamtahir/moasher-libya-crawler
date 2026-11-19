@@ -5,7 +5,7 @@ bypasses the client security rules. Credentials come ONLY from the environment (
   FIREBASE_SA_JSON   full JSON key of the service account (role: Cloud Datastore User on project moasher-libya)
 Safety: values are re-checked here with the same bounds as the rules; DRY_RUN=1 prints instead of writing.
 Usage: python3 server/publish.py /tmp/board_writes.json /tmp/cache_seed.json /tmp/news_seed.json"""
-import json, os, sys, time
+import hashlib, json, os, sys, time
 
 PROJECT = 'moasher-libya'
 ROOT = f'projects/{PROJECT}/databases/(default)/documents'
@@ -60,12 +60,35 @@ def main():
     if os.environ.get('DRY_RUN') == '1' or not os.environ.get('FIREBASE_SA_JSON'):
         for x in writes[:80]: print('  DRY', 'delete' if 'delete' in x else '', (x.get('update', {}).get('name') or x['delete']).split('/documents/')[1])
         return
+    # Loop mode: skip cache/news docs whose content did not change since this runner last wrote them (STATE_FILE),
+    # so a 1-minute loop only spends Firestore writes on real changes.
+    state_path = os.environ.get('STATE_FILE'); state = {}
+    if state_path and os.path.exists(state_path):
+        try: state = json.load(open(state_path))
+        except Exception: state = {}
+    def sig(x):
+        u = x.get('update')
+        if not u or 'updateTransforms' not in x: return None, None     # latest/ticks/deletes are already change-only
+        return u['name'], hashlib.sha1(json.dumps(u['fields'], sort_keys=True).encode()).hexdigest()
+    keep = []
+    for x in writes:
+        name, h = sig(x)
+        if name and state.get(name) == h: continue
+        keep.append(x)
+    if len(keep) != len(writes): print(f'unchanged skipped: {len(writes) - len(keep)}')
+    writes = keep
     s = session(); failed = 0
     # ticks use exists:false preconditions, so commit one by one (a failed precondition must not drop the batch)
     for x in writes:
         r = s.post(f'https://firestore.googleapis.com/v1/{ROOT}:commit', json={'writes': [x]}, timeout=60)
         if not r.ok and 'ALREADY_EXISTS' not in r.text and 'FAILED_PRECONDITION' not in r.text:
             failed += 1; print('write failed', (x.get('update', {}).get('name') or x['delete']).split('/documents/')[1], r.status_code)
+        else:
+            name, h = sig(x)
+            if name: state[name] = h
+    if state_path:
+        try: json.dump(state, open(state_path, 'w'))
+        except Exception: pass
     # heartbeat so the app owner (and a later rules switch) can verify the crawler is alive
     s.post(f'https://firestore.googleapis.com/v1/{ROOT}:commit', json={'writes': [{'update': {'name': f'{ROOT}/config/crawler', 'fields': {
         'writes': val(len(writes)), 'failed': val(failed), 'news': val(n_news)}}, 'updateTransforms': [{'fieldPath': 'at', 'setToServerValue': 'REQUEST_TIME'}]}]}, timeout=60)

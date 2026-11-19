@@ -1,4 +1,4 @@
-# Libya Index server crawler (phase 3): keeps latest/ticks/cache fresh from a trusted server, every 10 minutes.
+# Libya Index server crawler (phase 3): keeps latest/ticks/cache fresh from a trusted server, every minute (loop mode).
 # Secrets (Settings → Secrets and variables → Actions): FIREBASE_SA_JSON (service account key JSON), SOURCES_JSON (data sources).
 name: crawler
 run-name: ${{ (github.event_name == 'workflow_dispatch' && inputs.loop) && 'crawler loop' || 'crawler' }}
@@ -14,7 +14,7 @@ on:
         type: boolean
         default: true
       loop:
-        description: 'Keep crawling every 10 min for ~5h45m, then restart itself (GitHub cron alone is unreliable)'
+        description: 'Keep crawling every 1 min for ~5h35m, then restart itself (GitHub cron alone is unreliable)'
         type: boolean
         default: false
 concurrency:
@@ -53,31 +53,41 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
       - run: pip install --quiet google-auth requests
-      - name: Crawl and publish (once, or every 10 min in loop mode)
+      - name: Build once
+        run: gradle -q installDist
+      - name: Crawl and publish (once, or every 1 min in loop mode; writes only on change)
         env:
           FIREBASE_SA_JSON: ${{ secrets.FIREBASE_SA_JSON }}
           DRY_RUN: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run)) && '1' || '0' }}
           LOOP: ${{ (github.event_name == 'workflow_dispatch' && inputs.loop) && '1' || '0' }}
+          BOARD_CACHE: /tmp/board_cache.json     # board listing reused up to 10 min, re-read after any change
+          BOARD_MAX_AGE: '600'
+          STATE_FILE: /tmp/publish_state.json    # cache docs are written only when their content changed
         run: |
-          once() {
+          CP="build/install/moasher-libya-crawler/lib/*"
+          once() {   # $1 = 1 for a full pass (3 pages back + caches + news), 0 for a quick board pass
             rm -f /tmp/board_writes.json /tmp/cache_seed.json /tmp/news_seed.json
-            echo "::group::crawl $(date -u +%H:%M:%SZ)"
-            gradle -q run -PmainClass=tools.BoardCrawlerKt --args=/tmp/board_writes.json || echo 'board step failed'
-            gradle -q run -PmainClass=tools.CacheSeedKt --args=/tmp/cache_seed.json || true
-            gradle -q run -PmainClass=tools.NewsSeedKt --args=/tmp/news_seed.json || true
+            echo "::group::crawl $(date -u +%H:%M:%SZ) full=$1"
+            if [ "$1" = "1" ]; then BOARD_PAGES=3; else BOARD_PAGES=1; fi
+            BOARD_PAGES=$BOARD_PAGES java -cp "$CP" tools.BoardCrawlerKt /tmp/board_writes.json || echo 'board step failed'
+            if [ "$1" = "1" ]; then
+              java -cp "$CP" tools.CacheSeedKt /tmp/cache_seed.json || true
+              java -cp "$CP" tools.NewsSeedKt /tmp/news_seed.json || true
+            fi
             python3 server/publish.py /tmp/board_writes.json /tmp/cache_seed.json /tmp/news_seed.json || echo 'publish failed'
             echo "::endgroup::"
           }
-          start=$(date +%s)
-          once
+          start=$(date +%s); i=0
+          once 1
           if [ "$LOOP" = "1" ]; then
-            while [ $(( $(date +%s) - start )) -lt 20100 ]; do   # ~5h35m of iterations, then hand over to a fresh run
-              sleep $(( 600 - ( $(date +%s) - start ) % 600 ))
-              once
+            while [ $(( $(date +%s) - start )) -lt 20100 ]; do   # ~5h35m of 1-minute passes, then hand over to a fresh run
+              sleep $(( 60 - ( $(date +%s) - start ) % 60 ))
+              i=$((i + 1))
+              if [ $((i % 10)) -eq 0 ]; then once 1; else once 0; fi
             done
           fi
       - name: Restart the loop (loop runs hand over; cron runs revive a dead loop)
-        if: always() && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        if: ${{ !cancelled() && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         env:
           GH_TOKEN: ${{ github.token }}
           LOOP: ${{ (github.event_name == 'workflow_dispatch' && inputs.loop) && '1' || '0' }}

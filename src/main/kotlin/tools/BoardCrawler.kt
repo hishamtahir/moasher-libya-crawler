@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit
 private val http = OkHttpClient.Builder().callTimeout(30, TimeUnit.SECONDS).build()
 private const val UA = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
 private val BOARD_CHANNELS get() = Src.s.channels      // from the SOURCES_JSON secret
-private const val PAGES = 3
+private val PAGES = System.getenv("BOARD_PAGES")?.toIntOrNull()?.coerceIn(1, 5) ?: 3
 private const val FS = "https://firestore.googleapis.com/v1/projects/moasher-libya/databases/(default)/documents"
 
 private fun get(url: String, hdr: Map<String, String> = emptyMap()): String? = runCatching {
@@ -39,7 +39,14 @@ private fun str(f: JsonObject?, k: String): String? = f?.get(k)?.jsonObject?.get
 
 fun readBoard(): Map<String, ItemState>? {
     val key = System.getenv("WEB_API_KEY") ?: "AIzaSyCPbN6cKjCpscYPRmdX31nXMhxo5O9zDK4"
-    val body = get("$FS/latest?pageSize=300&key=$key", mapOf("Referer" to "https://moasher-libya.web.app/")) ?: return null
+    // Loop mode: BOARD_CACHE keeps the last board listing on the runner, so a 1-minute loop does not list all 34 docs
+    // every minute (Spark: 50k reads/day). It is reused for up to BOARD_MAX_AGE s and dropped whenever writes are planned.
+    val cache = System.getenv("BOARD_CACHE")?.let { File(it) }
+    val maxAge = (System.getenv("BOARD_MAX_AGE")?.toLongOrNull() ?: 600L) * 1000
+    val cached = cache?.takeIf { it.exists() && System.currentTimeMillis() - it.lastModified() < maxAge }?.readText()
+    val body = cached ?: (get("$FS/latest?pageSize=300&key=$key", mapOf("Referer" to "https://moasher-libya.web.app/")) ?: return null)
+        .also { b -> cache?.writeText(b) }
+    println(if (cached != null) "board: cached" else "board: read from Firestore")
     val docs = Json.parseToJsonElement(body).jsonObject["documents"]?.jsonArray ?: return emptyMap()
     return docs.mapNotNull { d ->
         val o = d.jsonObject; val k = o["name"]!!.jsonPrimitive.content.substringAfterLast('/'); val f = o["fields"]?.jsonObject
@@ -84,5 +91,6 @@ fun main(args: Array<String>) {
         put("boardSize", board.size); put("posts", posts.size); put("channelsOk", ok)
     }
     out.writeText(doc.toString())
+    if (newer.isNotEmpty() || ticks.isNotEmpty()) System.getenv("BOARD_CACHE")?.let { File(it).delete() }   // re-read after a change
     println("planned writes: latest=${newer.size} ticks=${ticks.size} (board ${board.size} items, ${posts.size} posts)")
 }
