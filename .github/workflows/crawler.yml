@@ -1,6 +1,7 @@
 # Libya Index server crawler (phase 3): keeps latest/ticks/cache fresh from a trusted server, every 10 minutes.
 # Secrets (Settings → Secrets and variables → Actions): FIREBASE_SA_JSON (service account key JSON), SOURCES_JSON (data sources).
 name: crawler
+run-name: ${{ (github.event_name == 'workflow_dispatch' && inputs.loop) && 'crawler loop' || 'crawler' }}
 on:
   push:
     branches: [main]          # code pushes run as a dry run (no writes)
@@ -12,12 +13,18 @@ on:
         description: 'Dry run (no writes)'
         type: boolean
         default: true
-concurrency: { group: crawler, cancel-in-progress: false }
-permissions: { contents: read }
+      loop:
+        description: 'Keep crawling every 10 min for ~5h45m, then restart itself (GitHub cron alone is unreliable)'
+        type: boolean
+        default: false
+concurrency:
+  group: ${{ (github.event_name == 'workflow_dispatch' && inputs.loop) && 'crawler-loop' || 'crawler' }}
+  cancel-in-progress: false
+permissions: { contents: read, actions: write }
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: ${{ (github.event_name == 'workflow_dispatch' && inputs.loop) && 355 || 8 }}
     env:
       SOURCES_JSON: ${{ secrets.SOURCES_JSON }}      # data sources live only in this secret, never in the repo
     steps:
@@ -46,14 +53,40 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
       - run: pip install --quiet google-auth requests
-      - name: Board (Telegram channels → latest/ticks)
-        run: gradle -q run -PmainClass=tools.BoardCrawlerKt --args=/tmp/board_writes.json
-      - name: Caches (materials, CBL, world charts)
-        run: gradle -q run -PmainClass=tools.CacheSeedKt --args=/tmp/cache_seed.json || true
-      - name: News (publisher WordPress API → cache/news, cache/news_{id})
-        run: gradle -q run -PmainClass=tools.NewsSeedKt --args=/tmp/news_seed.json || true
-      - name: Publish with the service account
+      - name: Crawl and publish (once, or every 10 min in loop mode)
         env:
           FIREBASE_SA_JSON: ${{ secrets.FIREBASE_SA_JSON }}
           DRY_RUN: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run)) && '1' || '0' }}
-        run: python3 server/publish.py /tmp/board_writes.json /tmp/cache_seed.json /tmp/news_seed.json
+          LOOP: ${{ (github.event_name == 'workflow_dispatch' && inputs.loop) && '1' || '0' }}
+        run: |
+          once() {
+            rm -f /tmp/board_writes.json /tmp/cache_seed.json /tmp/news_seed.json
+            echo "::group::crawl $(date -u +%H:%M:%SZ)"
+            gradle -q run -PmainClass=tools.BoardCrawlerKt --args=/tmp/board_writes.json || echo 'board step failed'
+            gradle -q run -PmainClass=tools.CacheSeedKt --args=/tmp/cache_seed.json || true
+            gradle -q run -PmainClass=tools.NewsSeedKt --args=/tmp/news_seed.json || true
+            python3 server/publish.py /tmp/board_writes.json /tmp/cache_seed.json /tmp/news_seed.json || echo 'publish failed'
+            echo "::endgroup::"
+          }
+          start=$(date +%s)
+          once
+          if [ "$LOOP" = "1" ]; then
+            while [ $(( $(date +%s) - start )) -lt 20100 ]; do   # ~5h35m of iterations, then hand over to a fresh run
+              sleep $(( 600 - ( $(date +%s) - start ) % 600 ))
+              once
+            done
+          fi
+      - name: Restart the loop (loop runs hand over; cron runs revive a dead loop)
+        if: always() && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOOP: ${{ (github.event_name == 'workflow_dispatch' && inputs.loop) && '1' || '0' }}
+        run: |
+          api=https://api.github.com/repos/${{ github.repository }}/actions/workflows/crawler.yml
+          if [ "$LOOP" != "1" ]; then
+            alive=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "$api/runs?per_page=30" | python3 -c 'import json,sys; print(sum(1 for r in json.load(sys.stdin).get("workflow_runs",[]) if r.get("display_title")=="crawler loop" and r.get("status") in ("queued","in_progress","waiting","pending")))')
+            [ "${alive:-0}" -gt 0 ] && { echo "loop already running"; exit 0; }
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "$api/dispatches" -d '{"ref":"main","inputs":{"dry_run":"false","loop":"true"}}')
+          echo "loop dispatch: HTTP $code"
