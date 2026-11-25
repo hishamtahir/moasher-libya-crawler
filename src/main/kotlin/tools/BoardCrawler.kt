@@ -67,7 +67,10 @@ fun fetchChannel(ch: String): List<RawPost>? {
 
 fun main(args: Array<String>) {
     val out = File(args.getOrElse(0) { "/tmp/board_writes.json" })
-    val board = readBoard() ?: run { System.err.println("board read failed"); kotlin.system.exitProcess(2) }
+    val boardRead = readBoard()
+    val boardFailed = boardRead == null
+    val board = boardRead ?: emptyMap()
+    if (boardFailed) System.err.println("board read failed; continuing from channels only")
     val posts = ArrayList<RawPost>(); var ok = 0
     for (ch in BOARD_CHANNELS) fetchChannel(ch)?.let { posts.addAll(it); ok++; println("channel ok: ${it.size} posts") } ?: println("channel failed")
     if (ok == 0) { System.err.println("no channel could be read"); kotlin.system.exitProcess(3) }
@@ -80,15 +83,19 @@ fun main(args: Array<String>) {
     val ticks = merged.ticks.filter { tk -> !Catalog.isLiveKey(tk.key) && states.containsKey(tk.key) && (board[tk.key]?.let { tk.t > it.t } ?: true) }
         .filter { tk -> !Catalog.isOtherKey(tk.key) || tk.t > otherCutoff }
         .distinctBy { it.key to it.t / 1000 }
+    fun stateObj(s: ItemState) = buildJsonObject {
+        put("v", s.value); put("t", s.t / 1000); put("lbl", s.label.take(60)); put("u", s.unit.take(24))
+        s.pv?.let { put("pv", it) }; s.pt?.let { put("pt", it / 1000) }
+    }
     val doc = buildJsonObject {
         putJsonObject("latest") {
-            for (s in newer) putJsonObject(s.key) {
-                put("v", s.value); put("t", s.t / 1000); put("lbl", s.label.take(60)); put("u", s.unit.take(24))
-                s.pv?.let { put("pv", it) }; s.pt?.let { put("pt", it / 1000) }
-            }
+            // When the current board could not be read (e.g. Spark quota), skip Firestore latest/ticks
+            // so we do not rewrite every key every minute. The full map still goes out in "states" for the relay.
+            if (!boardFailed) for (s in newer) put(s.key, stateObj(s))
         }
-        putJsonArray("ticks") { for (tk in ticks) addJsonObject { put("k", tk.key); put("t", tk.t / 1000); put("v", tk.v) } }
-        put("boardSize", board.size); put("posts", posts.size); put("channelsOk", ok)
+        putJsonArray("ticks") { if (!boardFailed) for (tk in ticks) addJsonObject { put("k", tk.key); put("t", tk.t / 1000); put("v", tk.v) } }
+        putJsonObject("states") { for (s in states.values) put(s.key, stateObj(s)) }
+        put("boardSize", board.size); put("posts", posts.size); put("channelsOk", ok); put("boardReadFailed", boardFailed)
     }
     out.writeText(doc.toString())
     if (newer.isNotEmpty() || ticks.isNotEmpty()) System.getenv("BOARD_CACHE")?.let { File(it).delete() }   // re-read after a change

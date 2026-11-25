@@ -101,7 +101,44 @@ def main():
     s.post(f'https://firestore.googleapis.com/v1/{ROOT}:commit', json={'writes': [{'update': {'name': f'{ROOT}/config/crawler', 'fields': {
         'writes': val(len(writes)), 'failed': val(failed), 'news': val(n_news)}}, 'updateTransforms': [{'fieldPath': 'at', 'setToServerValue': 'REQUEST_TIME'}]}]}, timeout=60)
     print(f'done: {len(writes) - failed} ok, {failed} failed')
+    relay_ingest(board, cache)
     sys.exit(1 if failed else 0)
+
+
+def relay_ingest(board, cache):
+    """Push a public snapshot to the Cloudflare Worker (KV). Skipped when RELAY_INGEST_SECRET is unset."""
+    secret = os.environ.get('RELAY_INGEST_SECRET')
+    if not secret or os.environ.get("DRY_RUN") == "1":
+        return
+    url = os.environ.get('RELAY_INGEST_URL') or 'https://moasher-relay.moasher-libya.workers.dev/ingest'
+    def item(k, d):
+        t = d.get('t') or 0
+        pt = d.get('pt') or 0
+        return {'key': k, 'label': d.get('lbl') or k, 'unit': d.get('u') or '',
+                'value': d.get('v'), 't': (t * 1000 if t and t < 10**12 else t),
+                'pv': d.get('pv'), 'pt': (pt * 1000 if pt and pt < 10**12 else pt) or None}
+    snap = {'at': int(time.time() * 1000), 'board': {}, 'posts': []}
+    src = ((board or {}).get('states') or (board or {}).get('latest') or {})
+    for k, d in src.items():
+        if not ok_value(k, d.get('v')): continue
+        snap['board'][k] = item(k, d)
+    if snap['board']:
+        snap['posts'] = [{'t': s['t'] or 0, 'id': 1000000 + i, 'l': [[s['key'], s['label'], s['value'], s['unit']]]}
+                         for i, s in enumerate(snap['board'].values())]
+    if cache:
+        if cache.get('cache/materials'):
+            snap['materials'] = cache['cache/materials']
+        mkt = {k.split('/', 1)[1]: v for k, v in cache.items() if k.startswith('mkt/')}
+        if mkt:
+            snap['mkt'] = mkt
+        if cache.get('cache/cbl'):
+            snap['cbl'] = cache['cache/cbl']
+    try:
+        import requests as rq
+        r = rq.post(url, json=snap, headers={'Authorization': 'Bearer ' + secret}, timeout=60)
+        print('relay ingest:', r.status_code)
+    except Exception as e:
+        print('relay ingest failed:', type(e).__name__)
 
 if __name__ == '__main__':
     main()

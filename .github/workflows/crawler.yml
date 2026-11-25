@@ -58,6 +58,8 @@ jobs:
       - name: Crawl and publish (once, or every 1 min in loop mode; writes only on change)
         env:
           FIREBASE_SA_JSON: ${{ secrets.FIREBASE_SA_JSON }}
+          RELAY_INGEST_SECRET: ${{ secrets.RELAY_INGEST_SECRET }}
+          RELAY_INGEST_URL: https://moasher-relay.moasher-libya.workers.dev/ingest
           DRY_RUN: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run)) && '1' || '0' }}
           LOOP: ${{ (github.event_name == 'workflow_dispatch' && inputs.loop) && '1' || '0' }}
           BOARD_CACHE: /tmp/board_cache.json     # board listing reused up to 10 min, re-read after any change
