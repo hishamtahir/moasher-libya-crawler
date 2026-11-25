@@ -135,7 +135,7 @@ def relay_ingest(board, cache):
             snap['cbl'] = cache['cache/cbl']
     try:
         import requests as rq
-        r = rq.post(url, json=snap, headers={'Authorization': 'Bearer ' + secret}, timeout=60)
+        r = rq.post(url, json=snap, headers={'Authorization': 'Bearer ' + secret, 'User-Agent': 'Mozilla/5.0 (compatible; MoasherCrawler/1.0; +https://moasher-libya.web.app)'}, timeout=60)
         print('relay ingest:', r.status_code)
     except Exception as e:
         print('relay ingest failed:', type(e).__name__)
