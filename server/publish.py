@@ -50,10 +50,78 @@ def session():
     creds = service_account.Credentials.from_service_account_info(info, scopes=['https://www.googleapis.com/auth/datastore'])
     return AuthorizedSession(creds)
 
+
+def merge_p1_board(board):
+    """Pull the Worker WhatsApp board and merge newest-t-wins into planned Firestore writes.
+    Auth uses the existing relay ingest secret (never a device-held service account).
+    Skipped when the secret is unset. Dry-run still fetches so the plan is visible.
+    """
+    secret = os.environ.get('RELAY_INGEST_SECRET')
+    if not secret:
+        return board
+    base = (os.environ.get('RELAY_INGEST_URL') or 'https://moasher-relay.moasher-libya.workers.dev/ingest').rstrip('/')
+    if base.endswith('/ingest'):
+        base = base[:-7]
+    url = base + '/p1/board'
+    try:
+        import requests as rq
+        r = rq.get(url, headers={'Authorization': 'Bearer ' + secret, 'User-Agent': 'Mozilla/5.0 (compatible; MoasherCrawler/1.0; +https://moasher-libya.web.app)'}, timeout=30)
+        if not r.ok:
+            print('p1 board:', r.status_code)
+            return board
+        rec = r.json() if r.content else {}
+    except Exception as e:
+        print('p1 board failed:', type(e).__name__)
+        return board
+    incoming = rec.get('board') if isinstance(rec, dict) else None
+    if not incoming:
+        return board
+    out = dict(board or {})
+    latest = dict(out.get('latest') or out.get('states') or {})
+    ticks = list(out.get('ticks') or [])
+    added = 0
+    for k, s in incoming.items():
+        if not isinstance(s, dict) or not ok_value(k, s.get('value') if s.get('value') is not None else s.get('v')):
+            continue
+        v = s.get('value') if s.get('value') is not None else s.get('v')
+        raw_t = s.get('t') or 0
+        t_sec = int(raw_t / 1000) if raw_t > 10**12 else int(raw_t)
+        if t_sec <= 0:
+            continue
+        prev = latest.get(k) or {}
+        prev_t = prev.get('t') or 0
+        prev_sec = int(prev_t / 1000) if prev_t > 10**12 else int(prev_t)
+        if prev and t_sec <= prev_sec:
+            continue
+        item = dict(prev)
+        item['v'] = v
+        item['t'] = t_sec
+        if s.get('label') or s.get('lbl'):
+            item['lbl'] = s.get('label') or s.get('lbl')
+        if s.get('unit') or s.get('u'):
+            item['u'] = s.get('unit') or s.get('u')
+        if s.get('pv') is not None:
+            item['pv'] = s['pv']
+        pt = s.get('pt')
+        if pt:
+            item['pt'] = int(pt / 1000) if pt > 10**12 else int(pt)
+        latest[k] = item
+        ticks.append({'k': k, 't': t_sec, 'v': v})
+        added += 1
+    if not added:
+        return board
+    out['latest'] = latest
+    out['ticks'] = ticks
+    if out.get('states') is not None:
+        out['states'] = latest
+    print('p1 board merged:', added, 'newer items')
+    return out
+
 def main():
     board = json.load(open(sys.argv[1])) if len(sys.argv) > 1 and os.path.exists(sys.argv[1]) else None
     cache = json.load(open(sys.argv[2])) if len(sys.argv) > 2 and os.path.exists(sys.argv[2]) else None
     news = json.load(open(sys.argv[3])) if len(sys.argv) > 3 and os.path.exists(sys.argv[3]) else None
+    board = merge_p1_board(board)
     writes = build_writes(board, cache, news)
     n_news = sum(1 for x in writes if 'cache/news' in (x.get('update', {}).get('name') or x.get('delete', '')))
     print(f'writes planned: {len(writes)}')
