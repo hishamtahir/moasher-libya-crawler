@@ -239,6 +239,47 @@ object PostParser {
     private val wBrent = cs("نفط برنت", "Brent", "برنت", "خام برنت", "النفط برنت")
     private val wWti = cs("WTI", "النفط الخام", "نفط خام", "Crude Oil", "نفط WTI", "خام WTI", "النفط الخام الأمريكي")
 
+    private val chequeTokenRe = Regex("(?:^|[^\\p{L}])(?:و)?(?:ب)?(?:ال)?(?:صكوك|صك|شيك)(?=[^\\p{L}]|$)")
+    private val chequeAllowedStems = listOf("دولار", "يورو", "باوند", "حوالة", "حواله", "تركيا", "تركية", "فضة", "نادر")
+        .map { Arabic.compact(it) }
+        .filter { it.isNotEmpty() }
+        .sortedByDescending { it.length }
+    private val chequeNeighbors = chequeAllowedStems.joinToString("|")
+    private val chequeCompactRe = Regex("(?:^|$chequeNeighbors)(?:ب)?(?:صكوك|صك|شيك)(?:$|$chequeNeighbors)")
+
+    private fun hasChequeWord(raw: String): Boolean {
+        if (chequeTokenRe.containsMatchIn(Arabic.normalize(raw))) return true
+        val c = Arabic.compact(raw)
+        return chequeCompactRe.containsMatchIn(c) || Regex("^(?:ب)?(?:صكوك|صك|شيك)$").matches(c)
+    }
+
+    private fun stripChequeStems(c: String): String = c
+        .replace("بصكوك", "")
+        .replace("بشيك", "")
+        .replace("بصك", "")
+        .replace("صكوك", "")
+        .replace("شيك", "")
+        .replace("صك", "")
+
+    private fun stripAllowedStems(c: String): String {
+        var s = c
+        for (st in chequeAllowedStems) s = s.replace(st, "")
+        return s
+    }
+
+    private fun chequeKey(raw: String): String? {
+        if (!hasChequeWord(raw)) return null
+        val c = Arabic.compact(raw)
+        val leftover = stripAllowedStems(stripChequeStems(c))
+        if (leftover.isNotEmpty()) return null
+        if ("فضه" in c) return "silver_turk_chk"
+        val turk = "تركيا" in c || "تركيه" in c
+        if ("يورو" in c) return if (turk) "chk_eur_tr" else null
+        if (turk) return "chk_usd_tr"
+        return "chk_usd"
+    }
+
+
     private fun classify(rawLabel: String, value: Double, unit: String): ParsedLine? {
         val c = Arabic.compact(rawLabel)
         if (c.isEmpty() || c.all { it.isDigit() }) return null
@@ -255,7 +296,10 @@ object PostParser {
         // Tunisian dinar / Egyptian pound against the Libyan dinar
         fx(c, unit, value)?.let { (k, v) -> return mapped(k, Math.round(v * 10000.0) / 10000.0) }
 
-        when {
+        val mappedCheque = chequeKey(rawLabel)
+        if (mappedCheque != null) {
+            key = mappedCheque
+        } else when {
             c in usdSet -> key = "cur_usd"
             c in eurSet -> key = "cur_eur"
             c in gbpSet -> key = "cur_gbp"
