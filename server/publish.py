@@ -77,10 +77,22 @@ def merge_p1_board(board):
     if not incoming:
         return board
     out = dict(board or {})
-    latest = dict(out.get('latest') or out.get('states') or {})
+    # compare against the full current board (states), but only write the keys that actually changed (latest)
+    states = dict(out.get('states') or {}); states.update(out.get('latest') or {})
+    latest = states
+    changed = dict(out.get('latest') or {})
     ticks = list(out.get('ticks') or [])
-    added = 0
+    # Loop mode: remember what this runner already wrote from the Worker board (STATE_FILE), because the Firestore board
+    # the Kotlin step compares against is cached up to 10 minutes and would otherwise rewrite the same docs every minute.
+    state_path = os.environ.get('STATE_FILE'); written = {}
+    if state_path and os.path.exists(state_path):
+        try: written = (json.load(open(state_path)) or {}).get('p1_written') or {}
+        except Exception: written = {}
+    old_cut = int(time.time()) - 7 * 86400
+    added = 0; marks = {}
     for k, s in incoming.items():
+        if k.startswith('w_') or k.startswith('c_'):
+            continue
         if not isinstance(s, dict) or not ok_value(k, s.get('value') if s.get('value') is not None else s.get('v')):
             continue
         v = s.get('value') if s.get('value') is not None else s.get('v')
@@ -92,6 +104,10 @@ def merge_p1_board(board):
         prev_t = prev.get('t') or 0
         prev_sec = int(prev_t / 1000) if prev_t > 10**12 else int(prev_t)
         if prev and t_sec <= prev_sec:
+            continue
+        if not prev and t_sec < old_cut:          # never resurrect week-old items the board already dropped
+            continue
+        if t_sec <= int(written.get(k) or 0):     # already written by this runner (board cache not refreshed yet)
             continue
         item = dict(prev)
         item['v'] = v
@@ -106,14 +122,16 @@ def merge_p1_board(board):
         if pt:
             item['pt'] = int(pt / 1000) if pt > 10**12 else int(pt)
         latest[k] = item
+        changed[k] = item
         ticks.append({'k': k, 't': t_sec, 'v': v})
+        marks[k] = t_sec
         added += 1
     if not added:
         return board
-    out['latest'] = latest
+    out['_p1_marks'] = marks
+    out['latest'] = changed
     out['ticks'] = ticks
-    if out.get('states') is not None:
-        out['states'] = latest
+    out['states'] = latest
     print('p1 board merged:', added, 'newer items')
     return out
 
@@ -158,10 +176,18 @@ def main():
     for x in writes:
         r = s.post(f'https://firestore.googleapis.com/v1/{ROOT}:commit', json={'writes': [x]}, timeout=60)
         if not r.ok and 'ALREADY_EXISTS' not in r.text and 'FAILED_PRECONDITION' not in r.text:
-            failed += 1; print('write failed', (x.get('update', {}).get('name') or x['delete']).split('/documents/')[1], r.status_code)
+            failed += 1; x['_failed'] = True; print('write failed', (x.get('update', {}).get('name') or x['delete']).split('/documents/')[1], r.status_code)
         else:
             name, h = sig(x)
             if name: state[name] = [h, time.time()]
+    marks = (board or {}).get('_p1_marks') or {}
+    if marks:
+        bad = {x.get('update', {}).get('name', '').rsplit('/', 1)[-1] for x in writes if x.get('_failed')}
+        pw = dict(state.get('p1_written') or {}); pw.update({k: t for k, t in marks.items() if k not in bad}); state['p1_written'] = pw
+        bc = os.environ.get('BOARD_CACHE')          # re-read the Firestore board next pass (it changed)
+        if bc and os.path.exists(bc):
+            try: os.remove(bc)
+            except Exception: pass
     if state_path:
         try: json.dump(state, open(state_path, 'w'))
         except Exception: pass
